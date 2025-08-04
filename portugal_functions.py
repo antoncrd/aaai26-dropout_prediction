@@ -187,8 +187,6 @@ def run_analysis_portugal(
     y: Union[pd.Series, np.ndarray] | None = None,
     *,
     alpha: float = 0.05,
-    n_rendus: int = 3,
-    quantile_cut: float = 0.15,
     nan_fill: float = -1.0,
     do_plot: bool = False,
     globe: bool = True,
@@ -207,50 +205,12 @@ def run_analysis_portugal(
     # on renomme pour compatibilité interne
     df0 = df0.fillna(nan_fill).rename(columns={"email": "student_id"})
 
-    # ── 1) Construction de y_all ─────────────────────────────────
-    if y is None:
-        # même code que précédemment pour construire y_all
-        mark_cols = [c for c in df0.columns if c.endswith("mark")][::-1]
-
-        def last_marks(row):
-            vals, cols = [], []
-            for c in mark_cols:
-                v = row[c]
-                if v >= 0:
-                    vals.append(v)
-                    cols.append(c)
-                    if len(vals) == n_rendus:
-                        break
-            return pd.Series({"cols": cols, "vals": vals})
-
-        tmp = df0.apply(last_marks, axis=1)
-        df0[["last_cols", "last_vals"]] = tmp
-
-        means = {c: df0.loc[df0[c] >= 0, c].mean() for c in mark_cols}
-
-        def norm_avg(vals, cols):
-            if not vals:
-                return np.nan
-            return np.mean([v / means[c] for v, c in zip(vals, cols)])
-
-        df0["norm_last_n"] = df0.apply(
-            lambda r: norm_avg(r["last_vals"], r["last_cols"]), axis=1
-        )
-
-        thresh = df0["norm_last_n"].quantile(quantile_cut)
-        y_all = (df0["norm_last_n"] < thresh).astype(int)
-        print(
-            f"Quantile {quantile_cut:.2f} = {thresh:.3f} → {y_all.mean() * 100:.1f}% positives"
-        )
-    else:
-        # si y fourni, on s'assure que c'est une Series alignée
-        y_all = pd.Series(y).reset_index(drop=True).astype(int)
+    y_all = pd.Series(y).reset_index(drop=True).astype(int)
 
     # array pour stratify et autres usages numpy
     y_all_arr = y_all.values
 
     # ── 2) Préparation des features & clusters ────────────────────
-    has_cluster = "cluster" in df0.columns
     clusters_all = df0.get("cluster", pd.Series(0, index=df0.index)).astype(int).values
 
     # curri_cols = [c for c in df0.columns if c.endswith("(grade)")]
@@ -292,6 +252,72 @@ def run_analysis_portugal(
     records: list[dict] = []
     trained_clfs: Dict[tuple[str, int], MapieClassifier] = {}
 
+    def split_train_cal_with_real_priority(
+        idx_tmp: np.ndarray,
+        y_tmp: np.ndarray,
+        src_tmp: np.ndarray,
+        cal_fraction: float = 0.25,  # 0.20/0.80 = 0.25 comme avant
+        random_state: int = 42,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Retourne (idx_tr, idx_cal, y_tr, y_cal) en assurant :
+        - stratification sur y
+        - la calibration prélève d'abord dans source=='real' puis complète sur le reste
+        """
+        rng = np.random.RandomState(random_state)
+        n_total = len(idx_tmp)
+        n_cal = int(round(n_total * cal_fraction))
+
+        df_tmp_split = pd.DataFrame({
+            "idx": idx_tmp,
+            "y": y_tmp,
+            "source": src_tmp
+        })
+
+        chosen_idx = []
+
+        # Allocation par classe pour garder l'équilibre
+        for cls, grp in df_tmp_split.groupby("y"):
+            n_cls = len(grp)
+            n_cal_cls = int(round(n_cal * n_cls / n_total))
+
+            grp_real = grp[grp["source"] == "real"]
+            grp_other = grp[grp["source"] != "real"]
+
+            # échantillonnage d'abord dans le réel
+            take_real = min(len(grp_real), n_cal_cls)
+            part_real = grp_real.sample(n=take_real, random_state=rng) if take_real > 0 else grp_real
+
+            remaining = n_cal_cls - take_real
+            if remaining > 0:
+                part_other = grp_other.sample(n=min(remaining, len(grp_other)), random_state=rng) if len(grp_other) > 0 else grp_other
+                chosen_idx.append(pd.concat([part_real["idx"], part_other["idx"]], ignore_index=True))
+            else:
+                chosen_idx.append(part_real["idx"])
+
+        idx_cal = pd.Index(np.concatenate([c.values for c in chosen_idx])) if len(chosen_idx) else pd.Index([])
+
+        # Si léger décalage dû aux arrondis, on complète en priorisant à nouveau 'real'
+        if len(idx_cal) < n_cal:
+            remaining_df = df_tmp_split[~df_tmp_split["idx"].isin(idx_cal)]
+            remaining_df = pd.concat([
+                remaining_df[remaining_df["source"] == "real"],
+                remaining_df[remaining_df["source"] != "real"]
+            ], ignore_index=True)
+            add_n = min(n_cal - len(idx_cal), len(remaining_df))
+            if add_n > 0:
+                extra = remaining_df.sample(n=add_n, random_state=rng)["idx"]
+                idx_cal = pd.Index(np.concatenate([idx_cal.values, extra.values]))
+
+        idx_cal = np.unique(idx_cal)
+        mask_tr = ~np.isin(idx_tmp, idx_cal)
+        idx_tr = idx_tmp[mask_tr]
+
+        y_tr = y_tmp[mask_tr]
+        y_cal = y_tmp[np.isin(idx_tmp, idx_cal)]
+
+        return idx_tr, idx_cal, y_tr, y_cal
+
     for name, base_clf in MODELS.items():
         for n in tqdm(range(1, len(prefixes) + 1), desc=name):
             clf = clone(base_clf)
@@ -307,15 +333,20 @@ def run_analysis_portugal(
                 random_state=42,
             )
 
-            # 3.b) split train / cal
-            idx_tr, idx_cal, y_tr, y_cal, cl_tr, cl_cal = train_test_split(
-                idx_tmp,
-                y_tmp,
-                cl_tmp,
-                test_size=0.20 / 0.80,
-                stratify=y_tmp,
+            src_all = df0["source"].values
+            src_tmp = src_all[idx_tmp]
+            idx_tr, idx_cal, y_tr, y_cal = split_train_cal_with_real_priority(
+                idx_tmp=idx_tmp,
+                y_tmp=y_tmp,
+                src_tmp=src_tmp,
+                cal_fraction=0.20 / 0.80,  # conserve la même taille de calibration qu'avant
                 random_state=42,
             )
+            # On aligne aussi les clusters correspondants
+            mask_tr = np.isin(idx_tmp, idx_tr)
+            mask_cal = np.isin(idx_tmp, idx_cal)
+            cl_tr = cl_tmp[mask_tr]
+            cl_cal = cl_tmp[mask_cal]
 
             # 3.c) construction des X
             X_tr = build_X(df0.loc[idx_tr], n)
