@@ -12,7 +12,7 @@ Deux jeux de données sont traités :
 
 ## ⚙️ Installation
 
-Python >= 3.10 recommandé. Créez un environnement virtuel puis installez les dépendances :
+Python >= 3.12 recommandé. Créez un environnement virtuel puis installez les dépendances :
 
 ```bash
 python -m venv .venv
@@ -143,13 +143,7 @@ Ouvrez les notebooks :
 - `pipeline_portugal.ipynb`
 
 Chaque notebook crée des variantes (*without cluster*, *without enrichment*, *with SMOTE*, *with GAN*†) et compare **couverture**/**largeur** des intervalles.  
-† *La variante “GAN” est un *placeholder* ; l’exemple d’oversampling fourni est de type **SMOTE‑like**.*
 
----
-
-## 📜 Licence
-
-Si vous avez une licence spécifique, ajoutez‑la ici (e.g. MIT). À défaut, ce dépôt est fourni **à des fins de recherche** sans garantie.
 
 ---
 
