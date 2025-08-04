@@ -213,7 +213,6 @@ def run_analysis_portugal(
     # ── 2) Préparation des features & clusters ────────────────────
     clusters_all = df0.get("cluster", pd.Series(0, index=df0.index)).astype(int).values
 
-    # curri_cols = [c for c in df0.columns if c.endswith("(grade)")]
     curri_cols = ['Previous qualification', "Curricular units 1st sem", "Curricular units 2nd sem"]
     prefixes = curri_cols.copy()
     dyn_cols = [
