@@ -181,7 +181,7 @@ def augment_minority_clusters(
     df_final = pd.concat([df_orig, df_synth], ignore_index=True)
     return df_final
 
-def run_analysis_bra(
+def run_analysis_portugal(
     csv_file: Path | None = None,
     df: pd.DataFrame | None = None,
     y: Union[pd.Series, np.ndarray] | None = None,
