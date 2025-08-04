@@ -1,29 +1,143 @@
-from typing import Tuple
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-import matplotlib.pyplot as plt
-from pathlib import Path
-from tqdm import tqdm
 from sklearn.neighbors import NearestNeighbors
-from typing import Tuple, Dict, Union, List
 from sklearn.base import clone
-from mapie.mondrian import MondrianCP
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split
 from mapie.classification import MapieClassifier
+from mapie.mondrian import MondrianCP
 from mapie.metrics import (
     classification_coverage_score,
     classification_mean_width_score
 )
-from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from typing import Tuple, Dict, Union
+from tqdm import tqdm
+from pathlib import Path
 from collections import deque
-from lightgbm import LGBMRegressor
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor
+from lightgbm import LGBMRegressor
 from sklearn.cluster import KMeans
+
+def oversample_minority_clusters(
+    df,
+    item_cols,
+    n_by_cluster_min=100,
+    k_neighbors=20,
+    cluster_col='cluster',
+    drop_cols=None
+):
+    """
+    Génère des échantillons synthétiques pour les clusters minoritaires dans un DataFrame.
+
+    Paramètres :
+    ----------
+    df : pandas.DataFrame
+        DataFrame source contenant les colonnes continues et catégorielles,
+        ainsi qu'une colonne de cluster.
+    item_cols : list[str]
+        Liste des colonnes numériques (features continues) à interpoler.
+    n_by_cluster_min : int, optionnel (défaut=100)
+        Nombre minimal d'échantillons à générer par cluster minoritaire.
+    k_neighbors : int, optionnel (défaut=20)
+        Nombre maximal de voisins considérés pour l'interpolation SMOTE-like.
+    cluster_col : str, optionnel (défaut='cluster')
+        Nom de la colonne de cluster dans `df`.
+    drop_cols : list[str] | None, optionnel
+        Colonnes à exclure avant l'oversampling (e.g. ['email', 'source']).
+        Si None, aucune colonne n'est supprimée.
+
+    Retourne :
+    -------
+    pandas.DataFrame
+        DataFrame combinant les échantillons originaux et synthétiques,
+        avec une colonne 'source' indiquant "orig" ou "synth".
+    """
+    # 0) Préparation
+    X = df.copy()
+    if drop_cols is not None:
+        X = X.drop(columns=drop_cols, errors='ignore')
+    X = X.fillna(0).reset_index(drop=True)
+
+    clusters = X[cluster_col].values
+    feature_cols = X.columns.drop(cluster_col)
+
+    # Séparation numérique vs catégoriel
+    num_cols = [c for c in feature_cols if c in item_cols]
+    cat_cols = [c for c in feature_cols if c not in num_cols]
+
+    # 1) Probabilités des catégories par cluster
+    cluster_cat_probs = {}
+    for cl, grp in X.groupby(cluster_col):
+        cluster_cat_probs[cl] = {
+            c: grp[c].value_counts(normalize=True).to_dict()
+            for c in cat_cols
+        }
+
+    # 2) Détermination des clusters minoritaires
+    counts = pd.Series(clusters).value_counts()
+    threshold = counts.quantile(0.25)
+    minor_cs = counts[counts < threshold].index.tolist()
+
+    # 3) Génération des échantillons synthétiques
+    rows_aug = []
+    num_idx = [feature_cols.get_loc(c) for c in num_cols]
+
+    for cl in minor_cs:
+        idx = np.where(clusters == cl)[0]
+        Xk = X.loc[idx, feature_cols].values
+        n_new_per = n_by_cluster_min // len(idx)
+
+        # Nombre de voisins effectifs (hors soi-même)
+        k_eff = max(1, min(k_neighbors, len(idx) - 1))
+        n_nbrs = min(k_eff + 1, len(Xk) - 1)
+
+        # Duplication si trop peu de points
+        if len(Xk) < 2:
+            for i in idx:
+                for _ in range(n_new_per):
+                    rows_aug.append(X.loc[i, feature_cols].to_dict())
+            continue
+
+        nbrs = NearestNeighbors(n_neighbors=n_nbrs, metric='euclidean')
+        nbrs.fit(Xk[:, num_idx])
+        neigh_idxs = nbrs.kneighbors(return_distance=False)
+
+        for i, xi in enumerate(Xk):
+            for _ in range(n_new_per):
+                nbr_list = [j for j in neigh_idxs[i] if j != i]
+                j = np.random.choice(nbr_list)
+                xj = Xk[j]
+
+                lam = np.random.rand()
+                num_new = xi[num_idx] + lam * (xj[num_idx] - xi[num_idx])
+
+                cat_new = {
+                    c: np.random.choice(
+                        list(cluster_cat_probs[cl][c].keys()),
+                        p=list(cluster_cat_probs[cl][c].values())
+                    )
+                    for c in cat_cols
+                }
+
+                new_row = {c: num_new[k] for k, c in enumerate(num_cols)}
+                new_row.update(cat_new)
+                new_row[cluster_col] = cl
+                rows_aug.append(new_row)
+
+    # 4) Assemblage du DataFrame final
+    df_synth = pd.DataFrame(rows_aug)
+    df_synth['source'] = 'synth'
+    df_synth[drop_cols] = np.nan if drop_cols is not None else None
+
+    df_orig = df.copy()
+
+    df_final = pd.concat([df_orig, df_synth], ignore_index=True)
+    return df_final
 
 def assign_clusters_with_min_size(
     df: pd.DataFrame,
@@ -78,110 +192,7 @@ def assign_clusters_with_min_size(
     df_out['cluster'] = labels
     return df_out
 
-def augment_minority_clusters(
-    df: pd.DataFrame,
-    grade_suffix: str = '(grade)',
-    numeric_extras: List[str] = ['Unemployment rate', 'Inflation rate', 'GDP'],
-    n_by_cluster_min: int = 100,
-    k_neighbors: int = 20,
-    min_quantile: float = 0.25,
-    drop_cols: List[str] = ['email', 'source']
-) -> pd.DataFrame:
-    """
-    Augmente les clusters minoritaires d'un DataFrame par interpolation de voisins proches,
-    avec génération contrôlée des variables numériques et catégorielles.
-
-    Args:
-        df (pd.DataFrame): Données d'origine, avec une colonne 'cluster'.
-        grade_suffix (str): Suffixe caractérisant les colonnes de type "note".
-        numeric_extras (list): Colonnes numériques supplémentaires à inclure.
-        min_quantile (float): Seuil de quantile pour définir les clusters minoritaires.
-        n_new_per (int): Nombre de points synthétiques par observation existante.
-        max_neighbors (int): Nombre max de voisins à utiliser dans NearestNeighbors.
-        drop_cols (list): Colonnes à exclure de l'espace des features.
-
-    Returns:
-        pd.DataFrame: Données concaténées (réelles + synthétiques).
-    """
-    # --- 0) Préparation ---
-    X = df.drop(columns=drop_cols).fillna(0).reset_index(drop=True).copy()
-    clusters = X['cluster'].values
-    feature_cols = X.columns.drop('cluster')
-
-    # Séparation numériques / catégorielles
-    num_cols = [c for c in feature_cols if c.endswith(grade_suffix)] + [c for c in numeric_extras if c in feature_cols]
-    cat_cols = [c for c in feature_cols if c not in num_cols]
-    cluster_col='cluster'
-    # --- 1) Probabilités conditionnelles des colonnes binaires/catégorielles par cluster ---
-    cluster_cat_probs = {}
-    for cl, grp in X.groupby(cluster_col):
-        cluster_cat_probs[cl] = {
-            c: grp[c].value_counts(normalize=True).to_dict()
-            for c in cat_cols
-        }
-
-    # 2) Détermination des clusters minoritaires
-    counts = pd.Series(clusters).value_counts()
-    threshold = counts.quantile(min_quantile)
-    minor_cs = counts[counts < threshold].index.tolist()
-
-    # 3) Génération des échantillons synthétiques
-    rows_aug = []
-    num_idx = [feature_cols.get_loc(c) for c in num_cols]
-
-    for cl in minor_cs:
-        idx = np.where(clusters == cl)[0]
-        Xk = X.loc[idx, feature_cols].values
-        n_new_per = n_by_cluster_min // len(idx)
-
-        # Nombre de voisins effectifs (hors soi-même)
-        k_eff = max(1, min(k_neighbors, len(idx) - 1))
-        n_nbrs = min(k_eff + 1, len(Xk) - 1)
-
-        # Duplication si trop peu de points
-        if len(Xk) < 2:
-            for i in idx:
-                for _ in range(n_new_per):
-                    rows_aug.append(X.loc[i, feature_cols].to_dict())
-            continue
-
-        nbrs = NearestNeighbors(n_neighbors=n_nbrs, metric='euclidean')
-        nbrs.fit(Xk[:, num_idx])
-        neigh_idxs = nbrs.kneighbors(return_distance=False)
-
-        for i, xi in enumerate(Xk):
-            for _ in range(n_new_per):
-                nbr_list = [j for j in neigh_idxs[i] if j != i]
-                j = np.random.choice(nbr_list)
-                xj = Xk[j]
-
-                lam = np.random.rand()
-                num_new = xi[num_idx] + lam * (xj[num_idx] - xi[num_idx])
-
-                cat_new = {
-                    c: np.random.choice(
-                        list(cluster_cat_probs[cl][c].keys()),
-                        p=list(cluster_cat_probs[cl][c].values())
-                    )
-                    for c in cat_cols
-                }
-
-                new_row = {c: num_new[k] for k, c in enumerate(num_cols)}
-                new_row.update(cat_new)
-                new_row[cluster_col] = cl
-                rows_aug.append(new_row)
-
-    # 4) Assemblage du DataFrame final
-    df_synth = pd.DataFrame(rows_aug)
-    df_synth['source'] = 'synth'
-    df_synth['email'] = np.nan 
-
-    df_orig = df.copy()
-
-    df_final = pd.concat([df_orig, df_synth], ignore_index=True)
-    return df_final
-
-def run_analysis_bra(
+def run_analysis_port(
     csv_file: Path | None = None,
     df: pd.DataFrame | None = None,
     y: Union[pd.Series, np.ndarray] | None = None,
@@ -189,11 +200,13 @@ def run_analysis_bra(
     alpha: float = 0.05,
     n_rendus: int = 3,
     quantile_cut: float = 0.15,
-    nan_fill: float = -1.0,
+    threshold:float = None,
+    nan_fill: float = 0,
     do_plot: bool = False,
     globe: bool = True,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, Dict[tuple[str,int], MapieClassifier]]:
-    # ── 0) Chargement de df0 ─────────────────────────────────────
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, Dict[tuple[str, int, str], MapieClassifier]]:
+
+    # 0) Chargement et préparation
     if df is None:
         if csv_file is None:
             raise ValueError("Either df or csv_file must be provided.")
@@ -204,19 +217,15 @@ def run_analysis_bra(
     if "email" not in df0.columns:
         raise ValueError("Must contain an 'email' column.")
 
-    # on renomme pour compatibilité interne
     df0 = df0.fillna(nan_fill).rename(columns={"email": "student_id"})
-
-    # ── 1) Construction de y_all ─────────────────────────────────
     if y is None:
-        # même code que précédemment pour construire y_all
+        # Extraction des dernières notes et normalisation
         mark_cols = [c for c in df0.columns if c.endswith("mark")][::-1]
-
         def last_marks(row):
             vals, cols = [], []
             for c in mark_cols:
                 v = row[c]
-                if v >= 0:
+                if v > 0:
                     vals.append(v)
                     cols.append(c)
                     if len(vals) == n_rendus:
@@ -225,244 +234,280 @@ def run_analysis_bra(
 
         tmp = df0.apply(last_marks, axis=1)
         df0[["last_cols", "last_vals"]] = tmp
+        df0["lastvals"] = df0["last_vals"].apply(lambda r: r[0])
 
-        means = {c: df0.loc[df0[c] >= 0, c].mean() for c in mark_cols}
-
-        def norm_avg(vals, cols):
-            if not vals:
-                return np.nan
-            return np.mean([v / means[c] for v, c in zip(vals, cols)])
-
-        df0["norm_last_n"] = df0.apply(
-            lambda r: norm_avg(r["last_vals"], r["last_cols"]), axis=1
-        )
-
-        thresh = df0["norm_last_n"].quantile(quantile_cut)
-        y_all = (df0["norm_last_n"] < thresh).astype(int)
-        print(
+        if threshold is None:
+            thresh = df0["lastvals"].quantile(quantile_cut)
+            y_all = (df0["lastvals"] < thresh).astype(int)
+            print(
             f"Quantile {quantile_cut:.2f} = {thresh:.3f} → {y_all.mean() * 100:.1f}% positives"
-        )
+            )
+        else:
+            y_all = (df0["lastvals"] < threshold).astype(int)
+            print(
+            f"threshold  = {threshold:.3f} → {y_all.mean() * 100:.1f}% positives"
+            )
     else:
         # si y fourni, on s'assure que c'est une Series alignée
         y_all = pd.Series(y).reset_index(drop=True).astype(int)
-
-    # array pour stratify et autres usages numpy
     y_all_arr = y_all.values
-
-    # ── 2) Préparation des features & clusters ────────────────────
+    # Features & clusters
     has_cluster = "cluster" in df0.columns
     clusters_all = df0.get("cluster", pd.Series(0, index=df0.index)).astype(int).values
-
-    # curri_cols = [c for c in df0.columns if c.endswith("(grade)")]
-    curri_cols = ['Previous qualification', "Curricular units 1st sem", "Curricular units 2nd sem"]
-    prefixes = curri_cols.copy()
-    dyn_cols = [
-        col for col in df0.columns
-        if any(col.startswith(pref) for pref in prefixes)
+    if y is None:
+        prefixes = list(dict.fromkeys(c.rsplit("_",1)[0] for c in mark_cols[::-1]))
+        static_cols = []
+    else:
+        item_pref = [f"Item {i}" for i in range(1,43)]
+        item_cols = [c for c in df0.columns if c.startswith("Item")]
+        prefixes = item_pref.copy()
+        static_cols = [
+        c for c in df0.columns
+        if c not in item_cols + ["student_id", "email", "dropout", "source", "cluster"]
         ]
-    static_cols = [
-    c for c in df0.columns
-    if c not in dyn_cols + ["student_id", "email", "dropout", "source", "cluster"]
-    ]
-
-    # 3) Adapter build_X pour ne prendre QUE ces items
-    def build_X(df_sub: pd.DataFrame, n: int) -> np.ndarray:
+    def build_X(df_sub: pd.DataFrame, prefixes: list, static_cols: list, n: int) -> np.ndarray:
         # on garde student_id + les n premiers items
-        dyn_cols_ = [
-        col for col in df0.columns
+        dyn_cols = [
+        col for col in df_sub.columns
         if any(col.startswith(pref) for pref in prefixes[:n])
         ]
-        keep = ["student_id"] + dyn_cols_ + static_cols
+        keep = ["student_id"] + static_cols + dyn_cols
         return df_sub[keep].set_index("student_id").values
-    # ── 3) Boucle conformal Mondrian ─────────────────────────────
+
+    # Classifiers
     MODELS = {
-        "RF": RandomForestClassifier(
-            n_estimators=1000,
-            min_samples_leaf=2,
-            class_weight="balanced",
-            n_jobs=-1,
-            random_state=42,
-        ),
-        "LR": LogisticRegression(
-            max_iter=1000, class_weight="balanced", n_jobs=-1, random_state=42
-        ),
+        "RF":  RandomForestClassifier(n_estimators=1000, random_state=42),# RandomForestClassifier(n_estimators=1000, min_samples_leaf=2, class_weight="balanced", n_jobs=-1, random_state=42),
+        "LR": LogisticRegression(max_iter=1000, class_weight="balanced",
+                                 n_jobs=-1, random_state=42),
         "GB": GradientBoostingClassifier(random_state=42),
     }
 
     records: list[dict] = []
-    trained_clfs: Dict[tuple[str, int], MapieClassifier] = {}
+    trained_clfs: Dict[tuple[str,int,str], Union[MapieClassifier, MondrianCP]] = {}
 
     for name, base_clf in MODELS.items():
         for n in tqdm(range(1, len(prefixes) + 1), desc=name):
             clf = clone(base_clf)
-            idx_all = df0.index.to_numpy()
-
-            # 3.a) split (train+cal) / test
+            idx_all = df0.index.values
             idx_tmp, idx_test, y_tmp, y_test, cl_tmp, cl_test = train_test_split(
-                idx_all,
-                y_all_arr,
-                clusters_all,
-                test_size=0.20,
-                stratify=y_all_arr,
-                random_state=42,
+                idx_all, y_all_arr, clusters_all,
+                test_size=0.20, stratify=y_all, random_state=42
             )
-
-            # 3.b) split train / cal
             idx_tr, idx_cal, y_tr, y_cal, cl_tr, cl_cal = train_test_split(
-                idx_tmp,
-                y_tmp,
-                cl_tmp,
-                test_size=0.20 / 0.80,
-                stratify=y_tmp,
-                random_state=42,
+                idx_tmp, y_tmp, cl_tmp,
+                test_size=0.20/0.80, stratify=y_tmp, random_state=42
             )
+            # print(df0.loc[idx_tr].columns)
+            X_tr   = build_X(df0.loc[idx_tr], prefixes, static_cols,  n)
+            X_cal  = build_X(df0.loc[idx_cal], prefixes, static_cols, n)
+            X_test = build_X(df0.loc[idx_test], prefixes, static_cols, n)
 
-            # 3.c) construction des X
-            X_tr = build_X(df0.loc[idx_tr], n)
-            X_cal = build_X(df0.loc[idx_cal], n)
-            X_test = build_X(df0.loc[idx_test], n)
-
-            # 3.d) entraînement + calibration
+            # Calibration globale (vanilla CP)
             clf.fit(X_tr, y_tr)
             calib = CalibratedClassifierCV(clf, cv="prefit", method="sigmoid")
             calib.fit(X_cal, y_cal)
-
-            mapie_global = MapieClassifier(estimator=calib, method="lac", cv="prefit").fit(X_cal, y_cal)
-            base_mapie = MapieClassifier(estimator=calib, method="lac", cv="prefit")
-
-            yp_glob, pset_glob = mapie_global.predict(X_test, alpha=alpha)
-            pset_glob = pset_glob[:,:,0]
-            # 3.e) préparation Mondrian sur clusters valides
+            mapie_global  = MapieClassifier(estimator=calib, method="lac", cv="prefit").fit(X_cal, y_cal)
+            base_mapie    = MapieClassifier(estimator=calib, method="lac", cv="prefit")
+            # Mondrian CP
             ser = pd.Series(y_cal, index=pd.Index(cl_cal, name="cluster"))
-            valid_clusters = (
-                ser.groupby("cluster")
-                .nunique()
-                .loc[lambda s: s >= 2]
-                .index.values
-            )
+            valid_clusters = ser.groupby("cluster").nunique().loc[lambda s: s>=2].index.values
+            # print('valid clusters : ', valid_clusters)
             mask_cal_valid = np.isin(cl_cal, valid_clusters)
-
-            mond_mapie = MondrianCP(
-                mapie_estimator=base_mapie
-            )
+            mond_mapie = MondrianCP(mapie_estimator=base_mapie)
             mond_mapie.fit(
-                X_cal[mask_cal_valid],
-                y_cal[mask_cal_valid],
-                partition=cl_cal[mask_cal_valid],
+                X_cal[mask_cal_valid], y_cal[mask_cal_valid],
+                partition=cl_cal[mask_cal_valid]
             )
 
-            # 3.f) prédiction conformal
-            mask_valid = np.isin(cl_test, valid_clusters)
-            print(valid_clusters)
-            mask_invalid = ~mask_valid
-            y_pred = np.empty_like(y_test)
-            pset = np.empty((len(y_test), 2), dtype=bool)
+            # Prédictions
+            mask_real = df0.loc[idx_test, "source"] == "real"
+            # Vanilla CP sur tout
+            yp_van, yps_van = mapie_global.predict(X_test, alpha=alpha)
+            pset_van = yps_van[:, :, 0]
+            cov_van_all   = classification_coverage_score(y_test[mask_real], pset_van[mask_real])
+            width_van_all = classification_mean_width_score(pset_van[mask_real])
+            records.append({
+                "method": "vanilla",
+                "model": name,
+                "n_projects": n,
+                "cluster": -1,
+                "coverage": cov_van_all,
+                "width": width_van_all
+            })
 
+            # Mondrian sur clusters valides et fallback
+            yp_mon = np.empty_like(y_test)
+            pset_mon = np.empty((len(y_test), 2), dtype=bool)
+            mask_valid   = np.isin(cl_test, valid_clusters)
+            mask_invalid = ~mask_valid
             if mask_valid.any():
                 try:
                     yp_v, yps_v = mond_mapie.predict(
-                        X_test[mask_valid], alpha=alpha, partition=cl_test[mask_valid]
+                        X_test[mask_valid], alpha=alpha,
+                        partition=cl_test[mask_valid]
                     )
                 except ValueError:
-                    yp_v, yps_v = mapie_global.predict(
-                        X_test[mask_valid], alpha=alpha
-                    )
-                y_pred[mask_valid] = yp_v
-                pset[mask_valid] = yps_v[:, :, 0]
-
+                    yp_v, yps_v = mapie_global.predict(X_test[mask_valid], alpha=alpha)
+                yp_mon[mask_valid]  = yp_v
+                pset_mon[mask_valid] = yps_v[:, :, 0]
             if mask_invalid.any():
                 if globe:
-                    yp_g, yps_g = mapie_global.predict(
-                        X_test[mask_invalid], alpha=alpha
-                    )
-                    y_pred[mask_invalid] = yp_g
-                    pset[mask_invalid] = yps_g[:, :, 0]
+                    yp_g, yps_g = mapie_global.predict(X_test[mask_invalid], alpha=alpha)
+                    yp_mon[mask_invalid]  = yp_g
+                    pset_mon[mask_invalid] = yps_g[:, :, 0]
                 else:
                     for k in np.unique(cl_test[mask_invalid]):
                         mask_k = mask_invalid & (cl_test == k)
                         y_k = np.unique(y_cal[cl_cal == k])[0]
-                        y_pred[mask_k] = y_k
-                        pset_bool_k = np.zeros((mask_k.sum(), pset.shape[1]), dtype=bool)
+                        yp_mon[mask_k] = y_k
+                        pset_bool_k = np.zeros((mask_k.sum(), pset_mon.shape[1]), dtype=bool)
                         pset_bool_k[:, int(y_k)] = True
-                        pset[mask_k] = pset_bool_k
+                        pset_mon[mask_k] = pset_bool_k
 
-            trained_clfs[(name, n)] = mond_mapie
+            cov_mon_all   = classification_coverage_score(y_test[mask_real], pset_mon[mask_real])
+            width_mon_all = classification_mean_width_score(pset_mon[mask_real])
+            records.append({
+                "method": "mondrian",
+                "model": name,
+                "n_projects": n,
+                "cluster": -1,
+                "coverage": cov_mon_all,
+                "width": width_mon_all
+            })
+            # Stockage des estimateurs
+            trained_clfs[(name, n, "vanilla")]   = mapie_global
+            trained_clfs[(name, n, "mondrian")] = mond_mapie
 
-            # 3.g) enregistrement des scores
-            mask_real = df0.loc[idx_test, "source"] == "real"
-            cov_all = classification_coverage_score(y_test[mask_real], pset[mask_real])
-            width_all = classification_mean_width_score(pset[mask_real])
-            records.append(
-                {   "method": "mondrian",
-                    "model": name,
-                    "n_projects": n,
-                    "cluster": -1,
-                    "coverage": cov_all,
-                    "width": width_all,
-                }
-            )
-            cov_glob = classification_coverage_score(y_test[mask_real], pset_glob[mask_real])
-            wid_glob = classification_mean_width_score(pset_glob[mask_real])
-            records.append(
-                {   "method": "vanilla",
-                    "model": name,
-                    "n_projects": n,
-                    "cluster": -1,
-                    "coverage": cov_glob,
-                    "width": wid_glob,
-                }
-            )
-
-    # ── 4) Agrégation des résultats ────────────────────────────────
+    # Agrégation
     df_detail = pd.DataFrame.from_records(records)
     df_agg_cluster = (
-        df_detail.groupby(["model", "cluster"])
-        .agg(mean_coverage=("coverage", "mean"), mean_width=("width", "mean"))
-        .reset_index()
+        df_detail.groupby(["method", "model", "cluster"]).agg(
+            mean_coverage=("coverage", "mean"),
+            mean_width=("width", "mean")
+        ).reset_index()
     )
     df_agg_global = (
-        df_detail.groupby("model")
-        .agg(mean_coverage=("coverage", "mean"), mean_width=("width", "mean"))
-        .reset_index()
+        df_detail.groupby(["method", "model"]).agg(
+            mean_coverage=("coverage", "mean"),
+            mean_width=("width", "mean")
+        ).reset_index()
         .assign(cluster="ALL")
     )
     df_agg = pd.concat([df_agg_cluster, df_agg_global], ignore_index=True)
 
-    # ── 5) Plots (inchangés) ───────────────────────────────────────
     if do_plot:
-        df_detail_1 = df_detail.fillna(-1)
-        clusters = df_detail_1["cluster"].unique()
-        metric_map = [("coverage", "Couverture"), ("width", "Width")]
-        for metric, label in metric_map:
-            for c in clusters:
-                if c == -1:
-                    mask = df_detail_1["cluster"].isna() | (df_detail_1["cluster"] == -1)
-                    title_cl = "global-split"
-                else:
-                    mask = df_detail_1["cluster"] == c
-                    title_cl = f"cluster {c}"
-                if not mask.any():
-                    continue
-                plt.figure()
-                for model, grp in df_detail_1[mask].groupby("model"):
-                    grp_sorted = grp.sort_values("n_projects")
-                    plt.plot(
-                        grp_sorted["n_projects"],
-                        grp_sorted[metric],
-                        label=model,
-                        marker="o",
-                        linewidth=2,
+        for metric, label in [("coverage", "Couverture"), ("width", "Width")]:
+            for method in df_detail["method"].unique():
+                for c in df_detail["cluster"].fillna("ALL").unique():
+                    mask = (df_detail["method"] == method) & (
+                        (df_detail["cluster"] == c) if c != "ALL" else df_detail["cluster"].isna() | (df_detail["cluster"] == None)
                     )
-                plt.xlabel("Nombre de projets")
-                plt.ylabel(label)
-                plt.title(f"{label} (α={alpha}) – {title_cl}")
-                plt.grid(True)
-                plt.legend()
-                plt.xticks(sorted(df_detail["n_projects"].unique()))
-                plt.tight_layout()
-                plt.show()
+                    if not mask.any():
+                        continue
+                    plt.figure()
+                    for model, grp in df_detail[mask].groupby("model"):
+                        grp_sorted = grp.sort_values("n_projects")
+                        plt.plot(grp_sorted["n_projects"], grp_sorted[metric], label=model, marker="o", linewidth=2)
+                    plt.xlabel("Nombre de projets")
+                    plt.ylabel(label)
+                    plt.title(f"{label} ({method}, α={alpha}) – cluster {c}")
+                    plt.grid(True)
+                    plt.legend(); plt.tight_layout(); plt.show()
 
     return df_detail, df_agg, y_all, trained_clfs
+
+class OneSidedSPCI_LGBM_Offline:
+    """
+    SPCI unilatéral [0 ; U] entraîné *hors-ligne*.
+
+    • RandomForestRegressor  → prédiction ponctuelle f̂
+    • LightGBM (quantile, alpha=1-α) → Q̂_t(1-α) calculé sur une fenêtre
+      fixe de résidus (longueur w) dérivés du jeu d'apprentissage.
+    """
+
+    # ---------- initialisation ----------
+    def __init__(self, alpha=0.1, w=400,
+                 n_estimators=200, max_depth=-1,
+                 random_state=0):
+
+        self.alpha = alpha
+        self.w     = w
+        self.res_buf = deque()
+
+        self.base_rf = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=None if max_depth == -1 else max_depth,
+            random_state=random_state,
+        )
+
+        self.gbr_upper = LGBMRegressor(
+            objective="quantile",
+            alpha=1 - alpha,
+            n_estimators=600,          # plus d’arbres
+            learning_rate=0.05,        # LR plus petit
+            num_leaves=15,             # plus de souplesse
+            min_data_in_leaf=5,        # autoriser petits nœuds
+            max_depth=5,
+            random_state=random_state,
+        )
+        self.gbr = GradientBoostingRegressor(
+            loss="quantile",
+            alpha=1 - alpha,    # quantile souhaité
+            n_estimators=300,
+            max_depth=3,
+            min_samples_leaf=5,
+            learning_rate=0.05,
+            random_state=0
+        )
+        self.is_ready = False                 # devient True après fit()
+
+    # ---------- entraînement offline ----------
+    def fit(self, X_train, y_train):
+        """Apprend f̂ et Q̂(1-α) une seule fois."""
+        # 1) f̂
+        self.base_rf.fit(X_train, y_train)
+        print("fit 1 ok")
+        # 2) résidus tronqués à 0 -> tampon
+        r = np.maximum(0.0, y_train - self.base_rf.predict(X_train))
+        self.res_buf.extend(r)
+
+        # 3) fenêtre glissante -> apprentissage du quantile
+        if len(self.res_buf) < self.w + 5:
+            raise ValueError("Jeu d'entraînement trop court pour w={}".format(self.w))
+
+        R = np.asarray(self.res_buf, dtype=float)
+        Y = R[self.w:]                                       # cibles r_{t'}
+        X = np.array([R[i - self.w:i] for i in range(self.w, len(R))])
+
+        self.gbr.fit(X, Y)
+        print("fit 2 ok")
+        self.is_ready = True
+        return self
+
+    # ---------- prédiction ----------
+    def predict_interval(self, x_t):
+        """
+        Renvoie l'intervalle [0 ; U_t] sans mise à jour.
+        """
+        if not self.is_ready:
+            raise RuntimeError("Le modèle doit être entraîné via .fit() avant prédiction.")
+
+        x_t = np.asarray(x_t).reshape(1, -1)
+        y_hat = self.base_rf.predict(x_t)[0]
+
+        x_feat = np.array(self._window_features()).reshape(1, -1)
+        q_sup  = self.gbr.predict(x_feat)[0]
+        U_t    = max(0.0, y_hat + q_sup)
+
+        return 0.0, U_t
+
+    # ---------- outil interne ----------
+    def _window_features(self):
+        """Renvoie la fenêtre de résidus utilisée à l'entraînement (longueur w)."""
+        buf = list(self.res_buf)
+        if len(buf) < self.w:                    # ne devrait jamais arriver après .fit()
+            buf = [0.0] * (self.w - len(buf)) + buf
+        return buf[-self.w:]
 
 class TwoSidedSPCI_RFQuant_Offline:
     """
@@ -585,6 +630,36 @@ class TwoSidedSPCI_RFQuant_Offline:
         U_t = y_hat + best_up
         return L_t, U_t
     
+def find_best_threshold(X: np.ndarray, y: np.ndarray):
+    """
+    Trouve le seuil s qui minimise sum((y - 1(X < s))**2).
+    Retourne le seuil optimal et l'erreur minimale.
+    """
+    # On s'assure que ce sont des arrays 1D de même taille
+    X = np.asarray(X).ravel()
+    y = np.asarray(y).ravel()
+    assert X.shape == y.shape, "X et y doivent avoir la même forme"
+    
+    # On trie X et on récupère l'ordre pour trier y de la même façon
+    order = np.argsort(X)
+    Xs = X[order]
+    ys = y[order]
+
+    thresholds = np.linspace(0,3,10000)  
+    
+    best_s = None
+    best_err = np.inf
+    # print(thresholds)
+    # Pour chaque seuil, on calcule l'erreur
+    for s in thresholds:
+        preds = (Xs < s).astype(int)
+        err = np.sum((ys - preds) ** 2)
+        if err < best_err:
+            best_err = err
+            best_s = s
+    
+    return best_s, best_err
+
 def build_X_(df_sub: pd.DataFrame, prefixes: list, static_cols: list, n: int) -> np.ndarray:
     # on garde student_id + les n premiers items
     dyn_cols = [
@@ -593,96 +668,3 @@ def build_X_(df_sub: pd.DataFrame, prefixes: list, static_cols: list, n: int) ->
     ]
     keep = ["email"] + static_cols + dyn_cols
     return df_sub[keep].set_index("email").values
-
-class OneSidedSPCI_LGBM_Offline:
-    """
-    SPCI unilatéral [0 ; U] entraîné *hors-ligne*.
-
-    • RandomForestRegressor  → prédiction ponctuelle f̂
-    • LightGBM (quantile, alpha=1-α) → Q̂_t(1-α) calculé sur une fenêtre
-      fixe de résidus (longueur w) dérivés du jeu d'apprentissage.
-    """
-
-    # ---------- initialisation ----------
-    def __init__(self, alpha=0.1, w=400,
-                 n_estimators=200, max_depth=-1,
-                 random_state=0):
-
-        self.alpha = alpha
-        self.w     = w
-        self.res_buf = deque()
-
-        self.base_rf = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=None if max_depth == -1 else max_depth,
-            random_state=random_state,
-        )
-
-        self.gbr_upper = LGBMRegressor(
-            objective="quantile",
-            alpha=1 - alpha,
-            n_estimators=600,          # plus d’arbres
-            learning_rate=0.05,        # LR plus petit
-            num_leaves=15,             # plus de souplesse
-            min_data_in_leaf=5,        # autoriser petits nœuds
-            max_depth=5,
-            random_state=random_state,
-        )
-        self.gbr = GradientBoostingRegressor(
-            loss="quantile",
-            alpha=1 - alpha,    # quantile souhaité
-            n_estimators=300,
-            max_depth=3,
-            min_samples_leaf=5,
-            learning_rate=0.05,
-            random_state=0
-        )
-        self.is_ready = False                 # devient True après fit()
-
-    # ---------- entraînement offline ----------
-    def fit(self, X_train, y_train):
-        """Apprend f̂ et Q̂(1-α) une seule fois."""
-        # 1) f̂
-        self.base_rf.fit(X_train, y_train)
-        print("fit 1 ok")
-        # 2) résidus tronqués à 0 -> tampon
-        r = np.maximum(0.0, y_train - self.base_rf.predict(X_train))
-        self.res_buf.extend(r)
-
-        # 3) fenêtre glissante -> apprentissage du quantile
-        if len(self.res_buf) < self.w + 5:
-            raise ValueError("Jeu d'entraînement trop court pour w={}".format(self.w))
-
-        R = np.asarray(self.res_buf, dtype=float)
-        Y = R[self.w:]                                       # cibles r_{t'}
-        X = np.array([R[i - self.w:i] for i in range(self.w, len(R))])
-
-        self.gbr.fit(X, Y)
-        print("fit 2 ok")
-        self.is_ready = True
-        return self
-
-    # ---------- prédiction ----------
-    def predict_interval(self, x_t):
-        """
-        Renvoie l'intervalle [0 ; U_t] sans mise à jour.
-        """
-        if not self.is_ready:
-            raise RuntimeError("Le modèle doit être entraîné via .fit() avant prédiction.")
-
-        x_t = np.asarray(x_t).reshape(1, -1)
-        y_hat = self.base_rf.predict(x_t)[0]
-
-        x_feat = np.array(self._window_features()).reshape(1, -1)
-        q_sup  = self.gbr.predict(x_feat)[0]
-        U_t    = max(0.0, y_hat + q_sup)
-
-        return 0.0, U_t
-
-    # ---------- outil interne ----------
-    def _window_features(self):
-        """Renvoie la fenêtre de résidus utilisée à l'entraînement (longueur w)."""
-        buf = list(self.res_buf)
-        if len(buf) < self.w:                    # ne devrait jamais arriver après .fit()
-            buf = [0.0] * (self.w - len(buf)) + buf
-        return buf[-self.w:]
